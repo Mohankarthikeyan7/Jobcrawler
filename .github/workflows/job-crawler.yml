@@ -1,0 +1,72 @@
+name: UK Company Job Crawler
+
+on:
+  schedule:
+    # Run every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      max_companies:
+        description: 'Maximum companies to process'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  EXCEL_FILE: companies.xlsx
+
+jobs:
+  crawl-jobs:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Check if Excel file exists
+      run: |
+        if [ ! -f "$EXCEL_FILE" ]; then
+          echo "Error: Excel file $EXCEL_FILE not found!"
+          echo "Please add your companies.xlsx file to the repository root."
+          exit 1
+        fi
+        
+    - name: Run job crawler
+      run: |
+        python job_crawler.py
+        
+    - name: Commit and push processed companies list
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add processed_companies.json
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update processed companies list - $(date)"
+          git push
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload logs as artifact
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: crawler-logs
+        path: |
+          *.log
+          processed_companies.json
+        retention-days: 30
