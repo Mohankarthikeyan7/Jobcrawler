@@ -49,29 +49,65 @@ class JobCrawler:
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
-        # Processed companies tracking file
+        # Progress tracking files (NO GIT OPERATIONS)
         self.processed_file = 'processed_companies.json'
-        self.load_processed_companies()
+        self.failed_file = 'failed_companies.json'
         
+        self.load_processed_companies()
+        self.load_failed_companies()
+    
     def load_processed_companies(self):
-        """Load the list of already processed companies"""
+        """Load the list of successfully processed companies"""
         try:
             if os.path.exists(self.processed_file):
                 with open(self.processed_file, 'r') as f:
                     self.processed_companies = json.load(f)
             else:
                 self.processed_companies = []
+            logger.info(f"Loaded {len(self.processed_companies)} processed companies")
         except Exception as e:
             logger.error(f"Error loading processed companies: {e}")
             self.processed_companies = []
     
     def save_processed_companies(self):
-        """Save the list of processed companies"""
+        """Save the list of processed companies (FILE ONLY)"""
         try:
             with open(self.processed_file, 'w') as f:
-                json.dump(self.processed_companies, f)
+                json.dump(self.processed_companies, f, indent=2)
+            logger.info(f"Saved {len(self.processed_companies)} processed companies")
         except Exception as e:
             logger.error(f"Error saving processed companies: {e}")
+    
+    def load_failed_companies(self):
+        """Load the list of companies that failed processing"""
+        try:
+            if os.path.exists(self.failed_file):
+                with open(self.failed_file, 'r') as f:
+                    self.failed_companies = json.load(f)
+            else:
+                self.failed_companies = {}
+            logger.info(f"Loaded {len(self.failed_companies)} failed companies")
+        except Exception as e:
+            logger.error(f"Error loading failed companies: {e}")
+            self.failed_companies = {}
+    
+    def save_failed_companies(self):
+        """Save the list of failed companies (FILE ONLY)"""
+        try:
+            with open(self.failed_file, 'w') as f:
+                json.dump(self.failed_companies, f, indent=2)
+            logger.info(f"Saved {len(self.failed_companies)} failed companies")
+        except Exception as e:
+            logger.error(f"Error saving failed companies: {e}")
+    
+    def should_retry_company(self, company_name):
+        """Check if we should retry a previously failed company"""
+        if company_name not in self.failed_companies:
+            return True
+        
+        retry_count = self.failed_companies[company_name].get('count', 0)
+        # Retry up to 3 times, then skip
+        return retry_count < 3
     
     def send_telegram_notification(self, message):
         """Send notification via Telegram"""
@@ -94,27 +130,190 @@ class JobCrawler:
         except Exception as e:
             logger.error(f"Error sending Telegram notification: {e}")
     
-    def get_company_website(self, company_name):
-        """Search for company's official website using Google search simulation"""
-        try:
-            # Simple approach: try common domain patterns
-            domain_patterns = [
-                f"{company_name.lower().replace(' ', '')}.com",
-                f"{company_name.lower().replace(' ', '')}.co.uk",
-                f"{company_name.lower().replace(' ', '-')}.com",
-                f"{company_name.lower().replace(' ', '-')}.co.uk"
-            ]
-            
-            for domain in domain_patterns:
+    def clean_company_name(self, company_name):
+        """Clean company name for better domain matching"""
+        # Remove common suffixes
+        suffixes = ['ltd', 'limited', 'plc', 'inc', 'corp', 'corporation', 'group', 'holdings', 'uk', 'technology', 'tech', 'digital', 'systems']
+        clean = company_name.lower()
+        
+        for suffix in suffixes:
+            clean = re.sub(rf'\b{suffix}\b', '', clean)
+        
+        # Remove extra spaces and special characters
+        clean = re.sub(r'[^\w\s-]', '', clean).strip()
+        clean = re.sub(r'\s+', ' ', clean)
+        
+        return clean
+    
+    def try_direct_domains(self, clean_name, original_name):
+        """Try various domain patterns"""
+        # Generate multiple domain variations
+        variations = [
+            clean_name.replace(' ', ''),
+            clean_name.replace(' ', '-'),
+            original_name.lower().replace(' ', ''),
+            original_name.lower().replace(' ', '-'),
+            ''.join(word[0] for word in clean_name.split()),  # acronym
+        ]
+        
+        extensions = ['.com', '.co.uk', '.uk', '.org']
+        
+        for variation in variations:
+            if not variation:
+                continue
+                
+            for ext in extensions:
+                domain = f"{variation}{ext}"
                 try:
-                    response = self.session.head(f"https://{domain}", timeout=10, allow_redirects=True)
+                    response = self.session.head(f"https://{domain}", timeout=8, allow_redirects=True)
                     if response.status_code == 200:
-                        return f"https://{domain}"
+                        # Verify it's actually the company by checking page content
+                        if self.verify_company_website(f"https://{domain}", original_name):
+                            logger.info(f"Found direct domain: {domain}")
+                            return f"https://{domain}"
                 except:
                     continue
+        return None
+    
+    def verify_company_website(self, url, company_name):
+        """Verify if the website actually belongs to the company"""
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code != 200:
+                return False
+                
+            soup = BeautifulSoup(response.content, 'html.parser')
+            page_text = soup.get_text().lower()
+            title = soup.find('title')
             
-            # If direct patterns don't work, try a simple search approach
-            # Note: In production, you might want to use a proper search API
+            # Check if company name appears in title or page content
+            company_words = company_name.lower().split()
+            matches = sum(1 for word in company_words if len(word) > 2 and word in page_text)
+            
+            # If at least half the company name words appear, consider it a match
+            return matches >= len(company_words) / 2
+            
+        except:
+            return True  # If we can't verify, assume it's correct
+    
+    def search_duckduckgo(self, company_name):
+        """Search for company using DuckDuckGo"""
+        try:
+            query = f"{company_name} official website UK"
+            search_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
+            
+            response = self.session.get(search_url, timeout=15)
+            if response.status_code != 200:
+                return None
+                
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find search result links
+            result_links = soup.find_all('a', {'class': 'result__url'})
+            
+            for link in result_links[:5]:  # Check top 5 results
+                href = link.get('href', '')
+                if href.startswith('http'):
+                    # Clean the URL
+                    clean_url = href.split('?')[0]  # Remove query parameters
+                    
+                    # Skip social media and directory sites
+                    skip_domains = ['facebook.com', 'twitter.com', 'linkedin.com', 'wikipedia.org', 
+                                  'companies.house.gov.uk', 'companieshouse.gov.uk']
+                    
+                    if not any(skip in clean_url for skip in skip_domains):
+                        if self.verify_company_website(clean_url, company_name):
+                            logger.info(f"Found via DuckDuckGo: {clean_url}")
+                            return clean_url
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"DuckDuckGo search failed for {company_name}: {e}")
+            return None
+    
+    def search_wikipedia(self, company_name):
+        """Search Wikipedia for company official website"""
+        try:
+            # Search Wikipedia
+            wiki_search_url = f"https://en.wikipedia.org/w/api.php"
+            params = {
+                'action': 'query',
+                'format': 'json',
+                'list': 'search',
+                'srsearch': f"{company_name} company UK",
+                'srlimit': 3
+            }
+            
+            response = self.session.get(wiki_search_url, params=params, timeout=10)
+            if response.status_code != 200:
+                return None
+                
+            data = response.json()
+            
+            # Check each search result
+            for result in data.get('query', {}).get('search', []):
+                page_title = result['title']
+                
+                # Get the Wikipedia page content
+                page_url = f"https://en.wikipedia.org/w/api.php"
+                page_params = {
+                    'action': 'query',
+                    'format': 'json',
+                    'prop': 'extracts|externallinks',
+                    'titles': page_title,
+                    'exintro': True,
+                    'explaintext': True,
+                    'elquery': '*',
+                    'ellimit': 10
+                }
+                
+                page_response = self.session.get(page_url, params=page_params, timeout=10)
+                if page_response.status_code == 200:
+                    page_data = page_response.json()
+                    pages = page_data.get('query', {}).get('pages', {})
+                    
+                    for page_id, page_info in pages.items():
+                        # Check external links for official website
+                        external_links = page_info.get('externallinks', [])
+                        
+                        for link in external_links:
+                            if any(domain in link for domain in ['.com', '.co.uk', '.uk']):
+                                # Skip social media
+                                if not any(social in link for social in ['facebook', 'twitter', 'linkedin']):
+                                    clean_link = link.split('?')[0]
+                                    if self.verify_company_website(clean_link, company_name):
+                                        logger.info(f"Found via Wikipedia: {clean_link}")
+                                        return clean_link
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Wikipedia search failed for {company_name}: {e}")
+            return None
+    
+    def get_company_website(self, company_name):
+        """Search for company's official website using multiple strategies"""
+        try:
+            # Clean company name for better matching
+            clean_name = self.clean_company_name(company_name)
+            
+            # Strategy 1: Try direct domain patterns
+            website = self.try_direct_domains(clean_name, company_name)
+            if website:
+                return website
+            
+            # Strategy 2: Search using DuckDuckGo
+            website = self.search_duckduckgo(company_name)
+            if website:
+                return website
+            
+            # Strategy 3: Try Wikipedia search (often has official links)
+            website = self.search_wikipedia(company_name)
+            if website:
+                return website
+                
+            logger.warning(f"Could not find website for {company_name} using any method")
             return None
             
         except Exception as e:
@@ -194,9 +393,14 @@ class JobCrawler:
         """Process a single company"""
         logger.info(f"Processing company: {company_name}")
         
-        # Skip if already processed
+        # Skip if already processed successfully
         if company_name in self.processed_companies:
-            logger.info(f"Skipping {company_name} - already processed")
+            logger.info(f"Skipping {company_name} - already processed successfully")
+            return None
+            
+        # Skip if failed too many times
+        if not self.should_retry_company(company_name):
+            logger.info(f"Skipping {company_name} - failed too many times")
             return None
         
         try:
@@ -204,7 +408,10 @@ class JobCrawler:
             website = self.get_company_website(company_name)
             if not website:
                 logger.warning(f"Could not find website for {company_name}")
-                self.processed_companies.append(company_name)
+                # Mark as failed
+                if company_name not in self.failed_companies:
+                    self.failed_companies[company_name] = {'count': 0, 'reason': 'no_website'}
+                self.failed_companies[company_name]['count'] += 1
                 return None
             
             logger.info(f"Found website for {company_name}: {website}")
@@ -213,7 +420,10 @@ class JobCrawler:
             career_pages = self.find_career_pages(website)
             if not career_pages:
                 logger.warning(f"No career pages found for {company_name}")
-                self.processed_companies.append(company_name)
+                # Mark as failed
+                if company_name not in self.failed_companies:
+                    self.failed_companies[company_name] = {'count': 0, 'reason': 'no_career_pages'}
+                self.failed_companies[company_name]['count'] += 1
                 return None
             
             # Check for job openings
@@ -250,20 +460,28 @@ class JobCrawler:
                 self.send_telegram_notification(message.strip())
                 logger.info(f"Found job openings at {company_name}: {all_found_jobs}")
                 
+                # Mark as successfully processed
                 self.processed_companies.append(company_name)
                 return result
             else:
                 logger.info(f"No relevant job openings found at {company_name}")
-                self.processed_companies.append(company_name)
+                # Mark as failed (no jobs found)
+                if company_name not in self.failed_companies:
+                    self.failed_companies[company_name] = {'count': 0, 'reason': 'no_jobs'}
+                self.failed_companies[company_name]['count'] += 1
                 return None
                 
         except Exception as e:
             logger.error(f"Error processing {company_name}: {e}")
-            self.processed_companies.append(company_name)
+            # Mark as failed
+            if company_name not in self.failed_companies:
+                self.failed_companies[company_name] = {'count': 0, 'reason': 'error'}
+            self.failed_companies[company_name]['count'] += 1
+            self.failed_companies[company_name]['last_error'] = str(e)
             return None
     
     def run(self, excel_file, max_companies=10):
-        """Main execution function"""
+        """Main execution function - NO GIT OPERATIONS"""
         logger.info(f"Starting job crawler - processing up to {max_companies} companies")
         
         try:
@@ -293,11 +511,12 @@ class JobCrawler:
                 if result:
                     results.append(result)
                 
-                # Save progress after each company
+                # Save progress after each company (FILES ONLY - NO GIT)
                 self.save_processed_companies()
+                self.save_failed_companies()
                 
-                # Add delay between requests to be respectful
-                time.sleep(random.uniform(2, 5))
+                # Add shorter delay between requests to be respectful but efficient
+                time.sleep(random.uniform(1, 3))
             
             logger.info(f"Completed processing. Found jobs at {len(results)} companies.")
             
@@ -313,6 +532,12 @@ class JobCrawler:
 {chr(10).join([f"• {r['company']}" for r in results])}
                 """
                 self.send_telegram_notification(summary.strip())
+            
+            # Print final statistics
+            print(f"=== FINAL STATISTICS ===")
+            print(f"Total processed companies: {len(self.processed_companies)}")
+            print(f"Total failed companies: {len(self.failed_companies)}")
+            print(f"Jobs found in this run: {len(results)}")
             
             return results
             
@@ -331,7 +556,7 @@ if __name__ == "__main__":
         logger.error(f"Excel file not found: {excel_file}")
         exit(1)
     
-    # Run crawler
+    # Run crawler (NO GIT OPERATIONS ANYWHERE)
     results = crawler.run(excel_file, max_companies=10)
     
     print(f"Crawling completed. Found jobs at {len(results)} companies.")
