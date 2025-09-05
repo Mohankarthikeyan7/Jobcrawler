@@ -9,6 +9,7 @@ import re
 import os
 from datetime import datetime
 import logging
+from fake_useragent import UserAgent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,9 +17,16 @@ logger = logging.getLogger(__name__)
 
 class JobCrawler:
     def __init__(self):
+        self.ua = UserAgent()
         self.session = requests.Session()
+        
+        # Rotate user agents for better success rate
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-GB,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
         })
         
         # Job keywords to search for
