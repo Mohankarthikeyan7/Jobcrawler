@@ -57,7 +57,7 @@ Your `companies.xlsx` file should have company names in the first column:
 
 1. Go to the Actions tab in your repository
 2. Enable workflows if prompted
-3. The crawler will start running automatically every 15 minutes
+3. The crawler will start running automatically every 10 minutes
 
 ### 5. Manual Execution
 
